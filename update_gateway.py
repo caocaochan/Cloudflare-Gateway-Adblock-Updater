@@ -65,6 +65,43 @@ blocklists: List[Dict[str, str]] = [
     }
 ]
 
+def resolve_policy_precedence(preferred: int, cached_rules: List[Dict], policy_name: str,
+                              existing_policy: Optional[Dict] = None,
+                              log_collision: bool = False) -> int:
+    """Return preferred precedence, or the next available value if another rule uses it."""
+    existing_policy_id = existing_policy.get('id') if existing_policy else None
+    used_precedences = {}
+
+    for rule in cached_rules:
+        if existing_policy_id and rule.get('id') == existing_policy_id:
+            continue
+
+        precedence = rule.get('precedence')
+        if precedence is None:
+            continue
+
+        try:
+            precedence = int(precedence)
+        except (TypeError, ValueError):
+            continue
+
+        used_precedences.setdefault(precedence, rule.get('name', 'unnamed rule'))
+
+    if preferred not in used_precedences:
+        return preferred
+
+    resolved = preferred + 1
+    while resolved in used_precedences:
+        resolved += 1
+
+    if log_collision:
+        logger.warning(
+            f"⚠️ Precedence {preferred} is already used by "
+            f"'{used_precedences[preferred]}'. Using {resolved} for '{policy_name}' instead."
+        )
+
+    return resolved
+
 # Version tracking functions
 def extract_version_from_description(description: str) -> Optional[str]:
     """
@@ -189,8 +226,17 @@ def should_update_filter(filter_config: Dict, cached_rules: List[Dict]) -> tuple
         return True, current_version, "Version changed"
     
     # Check if precedence matches
-    target_precedence = filter_config.get('priority')
+    target_precedence = resolve_policy_precedence(
+        filter_config.get('priority', 99),
+        cached_rules,
+        policy_name,
+        policy
+    )
     current_precedence = policy.get('precedence')
+    try:
+        current_precedence = int(current_precedence)
+    except (TypeError, ValueError):
+        pass
     
     if target_precedence is not None and current_precedence != target_precedence:
         logger.info(f"  ⚠️ Precedence mismatch: {current_precedence} (current) ≠ {target_precedence} (target)")
@@ -520,7 +566,16 @@ def update_policy_for_filter(filter_config: Dict, final_list_ids: List[str],
 
     # Build traffic expression
     expression = " or ".join([f"any(dns.domains[*] in ${lid})" for lid in final_list_ids])
-    priority = filter_config.get('priority', 99)
+    # Cloudflare requires unique rule precedence values. If the configured
+    # priority is occupied by another rule, keep this policy in the next slot.
+    existing_policy = next((rule for rule in cached_rules if rule['name'] == policy_name), None)
+    priority = resolve_policy_precedence(
+        filter_config.get('priority', 99),
+        cached_rules,
+        policy_name,
+        existing_policy,
+        log_collision=True
+    )
     
     # Build description with version info
     description = build_description_with_version(
@@ -541,8 +596,6 @@ def update_policy_for_filter(filter_config: Dict, final_list_ids: List[str],
     }
 
     # Check if policy exists to determine POST or PUT
-    existing_policy = next((rule for rule in cached_rules if rule['name'] == policy_name), None)
-    
     if existing_policy:
         logger.info(f"✍️ Updating existing policy '{policy_name}'...")
         async def run_update():
